@@ -25,6 +25,8 @@ RUN apk add --no-cache tzdata ca-certificates && \
 
 COPY --from=builder /build/upay_pro .
 COPY --from=builder /build/web ./web
+# 前端静态资源与 HTML 模板（程序运行时 LoadHTMLGlob("static/*.html") 依赖，缺失会 panic）
+COPY --from=builder /build/static ./static
 
 # 启动脚本
 COPY start.sh .
