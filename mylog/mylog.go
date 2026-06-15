@@ -23,7 +23,7 @@ func init() {
 	fileCore := zapcore.NewCore(
 		encoder,
 		zapcore.AddSync(&lumberjack.Logger{
-			Filename:   "logs/upay.log",
+			Filename:   "log/upay.log",
 			MaxSize:    30, // MB
 			MaxBackups: 3,
 			MaxAge:     7, // days
