@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  upay_pro:
+    image: upay_pro:latest
+    container_name: upay_pro
+    restart: always
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      # 数据库持久化
+      - /www/upay/data:/app/DBS
+      # 日志持久化
+      - /www/upay/log:/app/log
+    environment:
+      - TZ=Asia/Shanghai
