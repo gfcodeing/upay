@@ -117,16 +117,8 @@ func GetTransactionsGrid(order sdb.Orders) bool {
 
 		if amount == order.ActualAmount && apiResponse.Data[0].TransactionID != "" && apiResponse.Data[0].TokenInfo.Symbol == "USDT" && strings.EqualFold(apiResponse.Data[0].To, order.Token) && strings.EqualFold(apiResponse.Data[0].Type, "Transfer") {
 
-			// 符合要求就保存到数据库
-			order.BlockTransactionId = apiResponse.Data[0].TransactionID
-			order.Status = sdb.StatusPaySuccess
-			re := sdb.DB.Save(&order)
-			if re.Error == nil {
-				mylog.Logger.Info("USDT-TRC20 订单支付成功", zap.String("order_id", order.TradeId))
-				return true
-			}
-			mylog.Logger.Error("USDT-TRC20 保存数据库订单记录失败", zap.Error(re.Error))
-			return false
+			// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+			return sdb.MarkOrderPaid(order.TradeId, apiResponse.Data[0].TransactionID)
 
 		}
 		mylog.Logger.Error("TronGrid 获取的转账记录不满足要求")

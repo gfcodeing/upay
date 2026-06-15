@@ -131,16 +131,8 @@ func Start(order sdb.Orders) bool {
 		amount := formatAmount(apiResponse.Result[0].Value)
 
 		if timeStamp > order.StartTime && timeStamp < order.ExpirationTime && amount == order.ActualAmount && apiResponse.Result[0].Hash != "" && apiResponse.Result[0].TokenSymbol == "USDC" && strings.EqualFold(apiResponse.Result[0].To, order.Token) {
-			order.BlockTransactionId = apiResponse.Result[0].Hash
-			order.Status = sdb.StatusPaySuccess
-			// 更新数据库订单记录
-			re := sdb.DB.Model(&order).Updates(order)
-			if re.Error == nil {
-				mylog.Logger.Info("数据库订单记录更新成功", zap.Any("订单号", order.TradeId))
-				return true
-			}
-			mylog.Logger.Error("数据库订单记录更新失败", zap.Error(re.Error))
-			return false
+			// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+			return sdb.MarkOrderPaid(order.TradeId, apiResponse.Result[0].Hash)
 
 		}
 

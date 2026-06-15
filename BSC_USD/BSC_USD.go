@@ -43,9 +43,10 @@ type Transaction struct {
 
 // APIResponse 表示API响应结构
 type APIResponse struct {
-	Status  string        `json:"status"`
-	Message string        `json:"message"`
-	Result  []Transaction `json:"result"`
+	Status  string          `json:"status"`
+	Message string          `json:"message"`
+	Result  []Transaction   `json:"-"`
+	RawResult json.RawMessage `json:"result"`
 }
 
 // APIConfig 包含API请求的配置参数
@@ -132,6 +133,13 @@ func fetchBSCUSDTransactions(config *APIConfig) (*APIResponse, error) {
 		return nil, fmt.Errorf("JSON解析失败: %v", err)
 	}
 
+	// API无交易时result为字符串"No transactions found"，有交易时才是数组
+	if len(apiResp.RawResult) > 0 && apiResp.RawResult[0] == '[' {
+		if err := json.Unmarshal(apiResp.RawResult, &apiResp.Result); err != nil {
+			return nil, fmt.Errorf("交易列表解析失败: %v", err)
+		}
+	}
+
 	return &apiResp, nil
 }
 
@@ -214,16 +222,8 @@ func Start(order sdb.Orders) bool {
 		if data.Result[0].Hash != "" && data.Result[0].TokenSymbol == "BSC-USD" && timeStampMs > order.StartTime && timeStampMs < order.ExpirationTime && amount == order.ActualAmount && strings.EqualFold(data.Result[0].To, order.Token) {
 			// 如果在指定时间内，并且金额正确，并且交易Hash不为空，则说明已经入账成功，可以更新数据库
 			mylog.Logger.Info("BSC-USD 交易记录符合本次交易验证，接下来更新数据库")
-			order.BlockTransactionId = data.Result[0].Hash
-			order.Status = sdb.StatusPaySuccess
-			// 更新数据库订单记录
-			re := sdb.DB.Save(&order)
-			if re.Error == nil {
-				mylog.Logger.Info("USDT_BSC 订单入账成功")
-				return true
-			}
-			mylog.Logger.Error("USDT_BSC 订单入账失败", zap.Error(re.Error))
-			return false
+			// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+			return sdb.MarkOrderPaid(order.TradeId, data.Result[0].Hash)
 		} else {
 			mylog.Logger.Info("BSC-USD 交易记录不符合本次交易验证")
 		}

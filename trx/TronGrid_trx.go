@@ -186,16 +186,8 @@ func Start2(order sdb.Orders) bool {
 			amount := formatAmount(contract.Parameter.Value.Amount)
 
 			if amount == order.ActualAmount {
-				order.BlockTransactionId = tx.TxID
-				order.Status = sdb.StatusPaySuccess
-				// 更新数据库订单记录
-				re := sdb.DB.Save(&order)
-				if re.Error == nil {
-					mylog.Logger.Info("TRX_TronGrid更新数据库订单记录成功", zap.String("order_id", order.TradeId))
-					return true
-				}
-				mylog.Logger.Error("TRX_TronGrid更新数据库订单记录失败", zap.Error(re.Error))
-				return false
+				// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+				return sdb.MarkOrderPaid(order.TradeId, tx.TxID)
 			}
 			mylog.Logger.Info("TRX_TronGrid已经查询到转账记录，但是金额不符合要求")
 			return false

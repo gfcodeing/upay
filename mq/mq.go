@@ -87,18 +87,22 @@ func handleCheckStatusCodeTask(ctx context.Context, t *asynq.Task) error {
 	// 订单过期后，需要解锁钱包地址和金额【从Redis里删除】
 	payload := string(t.Payload())
 
-	var order sdb.Orders
-
-	err := sdb.DB.First(&order, "trade_id = ?", payload).Error
-	if err != nil {
-		mylog.Logger.Info("订单查询失败")
-		return err
+	// 用带条件的原子 UPDATE 把订单改为过期：仅当当前仍为「等待支付」时才生效。
+	// 不能先 First 读出再 Save 全字段覆盖——读和写之间若扫块协程刚把订单改为支付成功，
+	// 旧快照的 Save 会把「支付成功」覆盖回「已过期」，造成已付款订单被误判过期（资产风险）。
+	// 把状态判定下推到 SQL 的 WHERE，由数据库保证原子性。
+	result := sdb.DB.Model(&sdb.Orders{}).
+		Where("trade_id = ? AND status = ?", payload, sdb.StatusWaitPay).
+		Update("status", sdb.StatusExpired)
+	if result.Error != nil {
+		mylog.Logger.Error("订单过期状态更新失败", zap.String("trade_id", payload), zap.Error(result.Error))
+		return result.Error
 	}
-
-	if order.Status == sdb.StatusWaitPay {
-		order.Status = sdb.StatusExpired
-		sdb.DB.Save(&order)
-		mylog.Logger.Info(fmt.Sprintf("订单%v已设置为过期", order.TradeId))
+	if result.RowsAffected > 0 {
+		mylog.Logger.Info(fmt.Sprintf("订单%v已设置为过期", payload))
+	} else {
+		// 0 行受影响：订单已支付成功或已是其他状态，无需过期处理
+		mylog.Logger.Info("订单非等待支付状态，跳过过期处理", zap.String("trade_id", payload))
 	}
 
 	// 根据订单号查到记录，删除记录

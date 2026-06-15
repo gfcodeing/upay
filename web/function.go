@@ -422,22 +422,21 @@ func CreateTransaction(c *gin.Context) {
 
 		ActualAmount_Token := fmt.Sprintf("%s_%f", Token, ActualAmount)
 
-		// 检查Redis中是否有该金额
-		currentAmount := getRedisAmount(ActualAmount_Token)
-
-		// 如果钱包地址没有被占用，getRedisAmount 返回 false
-		if currentAmount == false {
-			err := rdb.RDB.Set(context.Background(), ActualAmount_Token, ActualAmount, sdb.GetSetting().ExpirationDate).Err()
-			if err != nil {
-				mylog.Logger.Error("设置 Redis 中金额时，操作过程发生错误", zap.Any("err", err))
-				continue
-			}
+		// 原子占用「钱包地址+金额」：用 SetNX（SET if Not eXists）一步完成「检查+占用」。
+		// 不能拆成 EXISTS + SET 两步——两步非原子，并发下单算出相同尾数金额时会同时通过检查，
+		// 导致两个不同订单拥有相同的 Token+ActualAmount，一笔真实付款会被两个订单同时判为入账。
+		ok, setErr := rdb.RDB.SetNX(context.Background(), ActualAmount_Token, ActualAmount, sdb.GetSetting().ExpirationDate).Result()
+		if setErr != nil {
+			mylog.Logger.Error("占用 Redis 中金额时，操作过程发生错误", zap.Any("err", setErr))
+			continue
+		}
+		if ok {
+			// 抢占成功，该金额此前未被占用
 			found = true
 			break
-		} else {
-			// 如果占用，增加该钱包的尝试次数
-			walletAttempts[Token]++
 		}
+		// 抢占失败，说明该金额已被占用，增加该钱包的尝试次数，换下一个递增金额
+		walletAttempts[Token]++
 	}
 
 	// 检查是否找到合适的配置
@@ -586,6 +585,8 @@ func (n Node) String() string {
 } */
 
 // 获取 Redis 中金额
+// 注意：下单流程已改用原子的 SetNX 完成「检查+占用」，不再调用本函数（EXISTS+SET 两步非原子，存在并发竞态）。
+// 保留此函数仅供其他场景的只读检查使用。
 func getRedisAmount(token string) bool {
 	// 通过 Exists 方法检查键是否存在
 	// result := rdb.RDB.Get(context.Background(), token).Val() 该方法不适合生成环境使用

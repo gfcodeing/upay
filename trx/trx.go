@@ -94,16 +94,8 @@ func Start(order sdb.Orders) bool {
 	if result.Data[0].TokenInfo.TokenAbbr == "trx" && order.StartTime < result.Data[0].Timestamp && result.Data[0].Timestamp < order.ExpirationTime && formatAmount(result.Data[0].Amount) == order.ActualAmount && result.Data[0].TransactionHash != "" {
 		// 如果在指定时间内，并且金额正确，并且交易Hash不为空，则说明已经入账成功，可以更新数据库
 
-		order.BlockTransactionId = result.Data[0].TransactionHash
-		order.Status = sdb.StatusPaySuccess
-		// 更新数据库订单记录
-		re := sdb.DB.Save(&order)
-		if re.Error == nil {
-			mylog.Logger.Info("TRX更新数据库订单记录成功", zap.String("order_id", order.TradeId))
-			return true
-		}
-		mylog.Logger.Error("TRX更新数据库订单记录失败", zap.Error(re.Error))
-		return false
+		// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+		return sdb.MarkOrderPaid(order.TradeId, result.Data[0].TransactionHash)
 		// go cron.ProcessCallback(order)
 
 	}

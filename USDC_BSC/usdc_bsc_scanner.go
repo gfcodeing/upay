@@ -1,72 +1,250 @@
 package USDC_BSC
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"math"
+	"math/big"
+	"net/http"
+	"strings"
+	"time"
 	"upay_pro/db/sdb"
 	"upay_pro/mylog"
 
-	"github.com/wangegou/bsc-usdt-scanner/scanner"
+	"go.uber.org/zap"
 )
 
-func Start_scan(order sdb.Orders) bool {
-	mylog.Logger.Info("正在通过扫区块获取BSC-USD 入账方向的交易数据...")
-	// 需要监控的钱包地址
-	// walletAddr := "0x5bd808Ab85C124f99080da5F864EDcB39950edE5"
-
-	// 开始扫描 (默认扫描过去 30 个区块，超时时间 1 分钟)
-	// 返回是一个按照时间倒序排列的切片
-
-	records, err := scanner.StartScan(order.Token, "USDC")
-	if err != nil {
-		log.Fatalf("扫描失败: %v", err)
+// ======================== 配置区 ========================
+// 注意：以下为业务关键配置，修改前请确认链上参数。
+var (
+	// BSC RPC 节点列表（主用 + 备用）。callRPC 会按顺序逐个尝试，直到某个节点成功返回。
+	// 若全部失败则报错，避免单节点故障导致整体漏单。
+	bscRpcURLs = []string{
+		"https://bsc-dataseed.binance.org/",
+		"https://bsc-dataseed1.defibit.io/",
+		"https://bsc-dataseed1.ninicoin.io/",
+		"https://rpc.ankr.com/bsc",
 	}
+)
 
-	mylog.Logger.Info(fmt.Sprintf("扫描完成! 发现 %d 笔入账:\n", len(records)))
+const (
+	// BSC USDC(BEP20) 合约地址
+	usdcContract = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+	// ERC20 Transfer 事件 topic0（Transfer(address,address,uint256) 的 keccak256）
+	transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	// USDC 精度（BEP20 USDC 为 18 位）
+	usdcDecimals = 18
+	// BSC 出块速度（秒/块），用于把订单过期时间换算成扫描区块数
+	bscBlockTime = 3
+	// 扫描区块缓冲数（在按过期时间换算的基础上多扫这么多块，防止边界遗漏）
+	scanBlockBuffer = 20
+	// HTTP 请求超时时间（秒）
+	httpTimeoutSeconds = 15
+	// 金额比对容差：链上 18 位精度经 float 转换后可能有微小尾差，
+	// 同时平台靠金额尾数（分）区分订单，故容差取半分（0.005）。
+	amountTolerance = 0.005
+)
 
-	// 打印第一条（最新的）记录作为示例
-	if len(records) > 0 {
-		/* rec := records[0]
-		fmt.Printf("最新一笔入账:\n")
-		fmt.Printf("- 时间:   %s\n", rec.Time.Format("2006-01-02 15:04:05"))
-		fmt.Printf("- 金额:   %f USDT\n", rec.Amount)
-		fmt.Printf("- 来自:   %s\n", rec.From)
-		fmt.Printf("- 哈希:   https://bscscan.com/tx/%s\n", rec.TxHash) */
-		// 只验证最新的一条入账记录
-		rec := records[0]
+// httpClient 带超时的 HTTP 客户端，避免节点无响应时永久阻塞扫块任务。
+var httpClient = &http.Client{Timeout: httpTimeoutSeconds * time.Second}
 
-		// 将时间转为毫秒时间戳
-		timeStampMs := rec.Time.UnixMilli()
-		// 将金额转为float64
+// ======================== RPC 结构 ========================
 
-		amountFloat64, _ := rec.Amount.Float64()
-		// 保留2位小数：先乘以100，四舍五入，再除以100
-		roundedAmount := math.Round(amountFloat64*100) / 100
-		// 如果查询的记录在订单的开始和过期时间之间，且金额匹配且TxHash不为空，则认为交易成功
-		if (order.StartTime < timeStampMs && timeStampMs < order.ExpirationTime) && roundedAmount == order.ActualAmount && rec.TxHash != "" {
-			mylog.Logger.Info("BSC-USDC 交易记录符合本次交易验证，接下来更新数据库")
-			order.BlockTransactionId = rec.TxHash
-			order.Status = sdb.StatusPaySuccess
-			// 更新数据库订单记录
-			re := sdb.DB.Save(&order)
-			if re.Error == nil {
-				mylog.Logger.Info("USDC-BSC 订单入账成功")
-				return true
-			}
-			mylog.Logger.Error("USDC-BSC 订单入账失败")
-			return false
-		} else {
-			mylog.Logger.Info("BSC-USDC 交易记录不符合本次交易验证")
-			mylog.Logger.Info(fmt.Sprintf("- 时间:   %s\n", rec.Time.Format("2006-01-02 15:04:05")))
-			mylog.Logger.Info(fmt.Sprintf("- 金额:   %f USDC\n", rec.Amount))
-			mylog.Logger.Info(fmt.Sprintf("- 来自:   %s\n", rec.From))
-			mylog.Logger.Info(fmt.Sprintf("- 哈希:   https://bscscan.com/tx/%s\n", rec.TxHash))
+type rpcRequest struct {
+	Jsonrpc string        `json:"jsonrpc"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+	ID      int           `json:"id"`
+}
 
-			return false
+type rpcResponse struct {
+	Result json.RawMessage `json:"result"`
+	Error  *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type ethLog struct {
+	TransactionHash string   `json:"transactionHash"`
+	BlockNumber     string   `json:"blockNumber"`
+	Topics          []string `json:"topics"`
+	Data            string   `json:"data"`
+}
+
+// callRPC 按顺序尝试 bscRpcURLs 中的每个节点，任一成功即返回；全部失败返回最后一个错误。
+func callRPC(method string, params []interface{}) (json.RawMessage, error) {
+	body, _ := json.Marshal(rpcRequest{Jsonrpc: "2.0", Method: method, Params: params, ID: 1})
+
+	var lastErr error
+	for _, rpcURL := range bscRpcURLs {
+		resp, err := httpClient.Post(rpcURL, "application/json", bytes.NewReader(body))
+		if err != nil {
+			lastErr = err
+			continue
 		}
+		raw, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var r rpcResponse
+		if err := json.Unmarshal(raw, &r); err != nil {
+			lastErr = fmt.Errorf("rpc响应解析失败(%s): %v", rpcURL, err)
+			continue
+		}
+		if r.Error != nil {
+			lastErr = fmt.Errorf("rpc error(%s): %s", rpcURL, r.Error.Message)
+			continue
+		}
+		return r.Result, nil
+	}
+	return nil, fmt.Errorf("所有BSC RPC节点均失败: %v", lastErr)
+}
 
+func getLatestBlock() (int64, error) {
+	result, err := callRPC("eth_blockNumber", []interface{}{})
+	if err != nil {
+		return 0, err
+	}
+	var hexBlock string
+	if err := json.Unmarshal(result, &hexBlock); err != nil {
+		return 0, fmt.Errorf("最新区块号解析失败: %v", err)
+	}
+	n, ok := new(big.Int).SetString(strings.TrimPrefix(hexBlock, "0x"), 16)
+	if !ok {
+		return 0, fmt.Errorf("最新区块号格式异常: %s", hexBlock)
+	}
+	return n.Int64(), nil
+}
+
+func getBlockTimestamp(hexBlock string) (int64, error) {
+	result, err := callRPC("eth_getBlockByNumber", []interface{}{hexBlock, false})
+	if err != nil {
+		return 0, err
+	}
+	var block struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.Unmarshal(result, &block); err != nil {
+		return 0, fmt.Errorf("区块信息解析失败: %v", err)
+	}
+	n, ok := new(big.Int).SetString(strings.TrimPrefix(block.Timestamp, "0x"), 16)
+	if !ok {
+		return 0, fmt.Errorf("区块时间戳格式异常: %s", block.Timestamp)
+	}
+	return n.Int64() * 1000, nil // 秒转毫秒
+}
+
+// parseLogAmount 将一条 Transfer 日志的 Data 字段（hex 金额）解析为保留2位小数的 USDC 金额。
+func parseLogAmount(data string) (float64, error) {
+	val, ok := new(big.Int).SetString(strings.TrimPrefix(data, "0x"), 16)
+	if !ok {
+		return 0, fmt.Errorf("金额格式异常: %s", data)
+	}
+	divisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(usdcDecimals), nil))
+	amount, _ := new(big.Float).Quo(new(big.Float).SetInt(val), divisor).Float64()
+	return math.Round(amount*100) / 100, nil
+}
+
+// scanAndMatch 扫描指定地址在订单有效期内的 USDC 入账，返回金额与时间均匹配的那一笔。
+// 不再只取最新一笔，而是遍历所有入账记录，避免同一地址在有效期内收到多笔时漏判真实付款。
+// 找到匹配返回 matched=true，否则 matched=false。
+func scanAndMatch(order sdb.Orders) (txHash string, amount float64, timestampMs int64, matched bool, err error) {
+	// 零地址防御：order.Token 为空会导致 paddedTo 变成零地址，
+	// 而合约 mint/burn 等操作确实会产生流向零地址的 Transfer，可能被误判入账，故直接拒绝。
+	toAddress := strings.TrimSpace(order.Token)
+	if toAddress == "" {
+		err = fmt.Errorf("订单收款地址为空，拒绝扫块")
+		return
 	}
 
-	return false
+	latest, err := getLatestBlock()
+	if err != nil {
+		return
+	}
+	// 根据动态配置的订单过期时间换算扫描区块数，多扫 scanBlockBuffer 块做缓冲
+	expirationSeconds := int64(sdb.GetSetting().ExpirationDate.Seconds())
+	scanBlockRange := expirationSeconds/bscBlockTime + scanBlockBuffer
+	fromBlock := latest - scanBlockRange
+	if fromBlock < 0 {
+		fromBlock = 0
+	}
+
+	// topic2: to 地址左补零到 32 字节
+	paddedTo := "0x000000000000000000000000" + strings.TrimPrefix(strings.ToLower(toAddress), "0x")
+
+	params := map[string]interface{}{
+		"address":   usdcContract,
+		"topics":    []interface{}{transferTopic, nil, paddedTo},
+		"fromBlock": fmt.Sprintf("0x%x", fromBlock),
+		"toBlock":   "latest",
+	}
+	result, err := callRPC("eth_getLogs", []interface{}{params})
+	if err != nil {
+		return
+	}
+
+	var logs []ethLog
+	if err = json.Unmarshal(result, &logs); err != nil {
+		err = fmt.Errorf("日志解析失败: %v", err)
+		return
+	}
+	if len(logs) == 0 {
+		return
+	}
+
+	// 倒序遍历（最新优先），返回第一笔金额与时间窗口都匹配的入账。
+	for i := len(logs) - 1; i >= 0; i-- {
+		l := logs[i]
+		if l.TransactionHash == "" {
+			continue
+		}
+		amt, perr := parseLogAmount(l.Data)
+		if perr != nil {
+			mylog.Logger.Warn("BSC-USDC 跳过一笔金额解析失败的日志", zap.String("txHash", l.TransactionHash), zap.Error(perr))
+			continue
+		}
+		// 金额容差比较，避免 float 尾差导致漏判
+		if math.Abs(amt-order.ActualAmount) >= amountTolerance {
+			continue
+		}
+		ts, terr := getBlockTimestamp(l.BlockNumber)
+		if terr != nil {
+			mylog.Logger.Warn("BSC-USDC 跳过一笔区块时间获取失败的日志", zap.String("txHash", l.TransactionHash), zap.Error(terr))
+			continue
+		}
+		// 时间窗口校验：必须落在订单开始与过期之间
+		if ts <= order.StartTime || ts >= order.ExpirationTime {
+			continue
+		}
+		return l.TransactionHash, amt, ts, true, nil
+	}
+
+	return
+}
+
+func Start_scan(order sdb.Orders) bool {
+	mylog.Logger.Info("正在通过扫区块获取BSC-USDC 入账方向的交易数据...")
+
+	txHash, amount, timestampMs, matched, err := scanAndMatch(order)
+	if err != nil {
+		mylog.Logger.Error("扫块查询失败", zap.Error(err))
+		return false
+	}
+
+	if !matched {
+		mylog.Logger.Info("BSC-USDC 未发现符合本次交易的入账记录",
+			zap.Float64("期望金额", order.ActualAmount),
+			zap.Int64("订单开始", order.StartTime), zap.Int64("订单过期", order.ExpirationTime))
+		return false
+	}
+
+	mylog.Logger.Info(fmt.Sprintf("BSC-USDC 交易记录符合本次交易验证: amount=%.2f txHash=%s time=%s，接下来更新数据库",
+		amount, txHash, time.UnixMilli(timestampMs).Format("2006-01-02 15:04:05")))
+
+	// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+	return sdb.MarkOrderPaid(order.TradeId, txHash)
 }

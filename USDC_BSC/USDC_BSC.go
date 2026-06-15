@@ -172,16 +172,8 @@ func Start(order sdb.Orders) bool {
 		if data.Result[0].Hash != "" && data.Result[0].TokenSymbol == "USDC" && timeStampMs > order.StartTime && timeStampMs < order.ExpirationTime && amount == order.ActualAmount && strings.EqualFold(data.Result[0].To, order.Token) {
 			// 如果在指定时间内，并且金额正确，并且交易Hash不为空，则说明已经入账成功，可以更新数据库
 
-			order.BlockTransactionId = data.Result[0].Hash
-			order.Status = sdb.StatusPaySuccess
-			// 更新数据库订单记录
-			re := sdb.DB.Save(&order)
-			if re.Error == nil {
-				mylog.Logger.Info("USDC_BSC: 订单入账成功")
-				return true
-			}
-			mylog.Logger.Error("USDC_BSC: 订单入账失败", zap.Error(re.Error))
-			return false
+			// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+			return sdb.MarkOrderPaid(order.TradeId, data.Result[0].Hash)
 		}
 		return false
 

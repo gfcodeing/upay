@@ -629,10 +629,18 @@ func Start() {
 				c.JSON(400, gin.H{"code": 1, "message": "订单不存在"})
 				return
 			}
-			order.Status = sdb.StatusPaySuccess
-			result := sdb.DB.Save(&order)
-			if result.Error != nil {
-				c.JSON(500, gin.H{"code": 1, "message": "保存失败"})
+			// 状态校验：只有「等待支付」的订单才允许补单，已支付/已过期不可补，避免非法状态跃迁与重复回调
+			if order.Status != sdb.StatusWaitPay {
+				c.JSON(400, gin.H{"code": 1, "message": "该订单非等待支付状态，不可补单"})
+				mylog.Logger.Info("手动补单被拒绝：订单非等待支付状态",
+					zap.String("trade_id", order.TradeId), zap.Int("status", order.Status))
+				return
+			}
+			// 原子入账（带状态守卫 + 唯一去重）。手动补单无真实链上 txHash，用 "manual:订单号" 作为标记值，
+			// 既满足唯一索引、又能在数据库区分出人工补单。仅当确实由待支付改为成功(返回 true)才触发回调，
+			// 从根本上与自动扫块互斥，杜绝双重入账。
+			if !sdb.MarkOrderPaid(order.TradeId, "manual:"+order.TradeId) {
+				c.JSON(400, gin.H{"code": 1, "message": "补单失败：订单已被处理或状态已变更"})
 				return
 			}
 			mylog.Logger.Info("订单已手动完成", zap.Any("order_id", order.OrderId))

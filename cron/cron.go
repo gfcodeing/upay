@@ -45,6 +45,16 @@ var httpClient = &http.Client{
 	},
 }
 
+// ======================== 配置区 ========================
+const (
+	// 回调分布式锁的 Redis key 前缀（完整 key = 前缀 + 订单号）
+	callbackLockKeyPrefix = "callback_lock:"
+	// 回调锁的过期时间（秒）。需覆盖回调最大重试耗时：最多 5 次、每次失败 sleep 5s，约 25s，
+	// 这里取 60s 留足余量，防止持锁协程异常退出导致锁无法释放时长期阻塞重试。
+	callbackLockTTL = 60 * time.Second
+)
+
+
 // 定义一个任务结构体 UsdtRateJob
 // 负责定期检查未支付订单的支付状态，并在支付成功后更新订单状态、发送通知和回调
 type UsdtCheckJob struct{}
@@ -397,6 +407,36 @@ func ProcessCallback(v sdb.Orders) {
 		mylog.Logger.Info("订单未支付，不需要异步回调", zap.Any("订单号：%s", v1.TradeId))
 		return
 	}
+
+	// 二次幂等判断：用最新订单状态再确认一次（v 是入参快照，可能已过期）
+	if v1.CallBackConfirm == sdb.CallBackConfirmOk {
+		mylog.Logger.Info("订单回调已确认，无需重复回调", zap.String("订单号", v1.TradeId))
+		return
+	}
+
+	// 分布式回调锁：保证同一订单的回调严格串行、只发一次。
+	// SkipIfStillRunning 只防 cron job 重叠，不防同一订单跨两轮各 go 出一个 ProcessCallback 协程，
+	// 故这里用 Redis SetNX 抢锁——抢不到说明已有协程在处理该订单，直接返回。
+	// TTL 取 callbackLockTTL，需覆盖最大重试耗时（约 5 次 * 5s）；处理结束后主动释放，
+	// 以便回调失败的订单能被下一轮 cron 重新触发重试。
+	cbCtx := context.Background()
+	callbackLockKey := fmt.Sprintf("%s%s", callbackLockKeyPrefix, v1.TradeId)
+	locked, lockErr := rdb.RDB.SetNX(cbCtx, callbackLockKey, 1, callbackLockTTL).Result()
+	if lockErr != nil {
+		mylog.Logger.Error("获取回调锁失败", zap.String("订单号", v1.TradeId), zap.Error(lockErr))
+		return
+	}
+	if !locked {
+		mylog.Logger.Info("该订单回调正在处理中，跳过本次重复触发", zap.String("订单号", v1.TradeId))
+		return
+	}
+	// 处理结束释放锁（成功时订单已标记 CallBackConfirmOk，上面的二次幂等会兜底；
+	// 失败时释放锁让下一轮 cron 可重试）
+	defer func() {
+		if err := rdb.RDB.Del(cbCtx, callbackLockKey).Err(); err != nil {
+			mylog.Logger.Error("释放回调锁失败", zap.String("订单号", v1.TradeId), zap.Error(err))
+		}
+	}()
 
 	// 异步回调
 

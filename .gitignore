@@ -1,0 +1,20 @@
+# 日志文件（运行时产物，不入库）
+log/
+*.log
+
+# 本地数据库文件
+DBS/
+*.db
+
+# IDE 配置
+.idea/
+*.code-workspace
+
+# 编译产物
+*.exe
+upay_pro
+main
+
+# 环境/临时文件
+.env
+*.tmp

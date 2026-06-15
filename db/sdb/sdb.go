@@ -53,7 +53,7 @@ type Orders struct {
 	OrderId            string  // 客户交易id
 	BlockTransactionId string  // 区块id
 	Amount             float64 // 订单金额，保留2位小数
-	ActualAmount       float64 // 订单实际需要支付的金额，保留4位小数
+	ActualAmount       float64 // 订单实际需要支付的金额，保留2位小数（按分区分订单，实现处统一 math.Round(x*100)/100）
 	Type               string  //钱包类型
 	Token              string  // 所属钱包地址
 	Status             int     // 1：等待支付，2：支付成功，3：已过期
@@ -158,6 +158,15 @@ func Start() {
 
 	// 迁移订单表
 	DB.AutoMigrate(&Orders{})
+
+	// 为区块交易ID(block_transaction_id)建立「部分唯一索引」：仅对非空值去重。
+	// 作用：同一笔链上交易(txHash)只能入账一个订单，作为重复入账的最后防线。
+	// 用部分索引(WHERE ...<>'')是因为大量待支付订单的该字段为空串，普通唯一索引会因多个空串而冲突。
+	if err := DB.Exec(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_block_tx_id ON orders(block_transaction_id) WHERE block_transaction_id <> '' AND block_transaction_id IS NOT NULL",
+	).Error; err != nil {
+		mylog.Logger.Error("创建 block_transaction_id 唯一索引失败", zap.Error(err))
+	}
 	// 迁移钱包地址表
 	DB.AutoMigrate(&WalletAddress{})
 	// 迁移设置表
@@ -318,4 +327,38 @@ func GetUserByUsername() string {
 		return ""
 	}
 	return user.UserName
+}
+
+// MarkOrderPaid 统一的原子入账函数：把订单标记为支付成功。
+//
+// 资产安全要点（所有入账路径——各币种扫块/API、手动补单——都必须走本函数，禁止再用 DB.Save(&order) 裸覆盖）：
+//  1. 状态守卫：带 WHERE status = StatusWaitPay 条件更新，已过期/已支付的订单不会被改动，
+//     杜绝「已过期订单被扫块复活」「并发重复入账」。
+//  2. txHash 去重：blockTransactionId 配合数据库唯一索引（见 Start() 中的条件唯一索引），
+//     同一笔链上交易只能入账一个订单；若该 txHash 已被占用，UPDATE 触发唯一约束冲突返回 error。
+//  3. 只更新受影响列（status、block_transaction_id），不全字段覆盖，避免覆盖回调状态等并发写入的字段。
+//
+// 返回 true 表示本次确实由「待支付」改为「支付成功」（RowsAffected==1）；
+// 返回 false 表示订单已非待支付（被其他路径抢先入账/已过期）或写入失败，调用方不应再触发回调。
+func MarkOrderPaid(tradeId string, blockTransactionId string) bool {
+	result := DB.Model(&Orders{}).
+		Where("trade_id = ? AND status = ?", tradeId, StatusWaitPay).
+		Updates(map[string]interface{}{
+			"status":               StatusPaySuccess,
+			"block_transaction_id": blockTransactionId,
+		})
+	if result.Error != nil {
+		// 唯一索引冲突（该 txHash 已入账其他订单）或数据库错误都会走到这里
+		mylog.Logger.Error("订单入账失败", zap.String("trade_id", tradeId),
+			zap.String("block_transaction_id", blockTransactionId), zap.Error(result.Error))
+		return false
+	}
+	if result.RowsAffected == 0 {
+		// 0 行：订单已非待支付（已被抢先入账或已过期），属正常的并发/幂等结果
+		mylog.Logger.Info("订单非待支付状态，跳过入账", zap.String("trade_id", tradeId))
+		return false
+	}
+	mylog.Logger.Info("订单入账成功", zap.String("trade_id", tradeId),
+		zap.String("block_transaction_id", blockTransactionId))
+	return true
 }

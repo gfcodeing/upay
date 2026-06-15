@@ -139,15 +139,8 @@ func GetTransactions(order sdb.Orders) bool {
 
 		if amount == order.ActualAmount && strings.EqualFold(response.TokenTransfers[0].ToAddress, order.Token) && response.TokenTransfers[0].TokenInfo.TokenAbbr == "USDT" && response.TokenTransfers[0].TransactionID != "" {
 			// 如果满足条件，则说明已经查到转账记录，并且金额和数据库转换后的金额，则就可以更新数据库中
-			order.BlockTransactionId = response.TokenTransfers[0].TransactionID
-			order.Status = sdb.StatusPaySuccess
-			re := sdb.DB.Save(&order)
-			if re.Error == nil {
-				mylog.Logger.Info("USDT-TRC20 更新数据库订单记录成功", zap.String("order_id", order.TradeId))
-				return true
-			}
-			mylog.Logger.Error("USDT-TRC20 更新数据库订单记录失败", zap.Error(re.Error))
-			return false
+			// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+			return sdb.MarkOrderPaid(order.TradeId, response.TokenTransfers[0].TransactionID)
 		}
 		mylog.Logger.Info("已经查询到转账记录，但是不符合要求")
 		return false

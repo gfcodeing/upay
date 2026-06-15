@@ -147,16 +147,8 @@ func Start(order sdb.Orders) bool {
 	// 符合条件就更新数据库
 
 	if strings.EqualFold(etherscanResp.Result[0].To, order.Token) && timeStampMs > order.StartTime && timeStampMs < order.ExpirationTime && amount == order.ActualAmount && etherscanResp.Result[0].Hash != "" && etherscanResp.Result[0].TokenSymbol == "USDC" {
-		order.BlockTransactionId = etherscanResp.Result[0].Hash
-		order.Status = sdb.StatusPaySuccess
-		// 更新数据库订单记录
-		re := sdb.DB.Save(&order)
-		if re.Error == nil {
-			mylog.Logger.Info("USDC_ERC20 订单入账成功")
-			return true
-		}
-		mylog.Logger.Error("USDC_ERC20 订单入账失败", zap.Error(re.Error))
-		return false
+		// 原子入账：带状态守卫 + txHash 唯一去重，禁止裸 Save 全字段覆盖
+		return sdb.MarkOrderPaid(order.TradeId, etherscanResp.Result[0].Hash)
 	}
 	mylog.Logger.Info("USDC_ERC20 找到的记录不满足要求，当前找的交易记录：", zap.Any("HASH", etherscanResp.Result[0].Hash), zap.Any("金额", amount), zap.Any("时间戳格式化后：", time.Unix(timeStamp, 0).Format("2006-01-02 15:04:05")))
 	return false
