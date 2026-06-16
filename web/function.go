@@ -377,63 +377,62 @@ func CreateTransaction(c *gin.Context) {
 		b.Add(node)
 	}
 
-	// 全局递增次数（金额全局唯一，不按钱包分别计数）
-	globalAttempts := 0
+	// 外层按金额递增，内层遍历所有钱包尝试占用该金额
+	// 金额全局唯一：同一金额只能有一个订单，跨钱包不重复
+	walletCount := len(walletAddrs)
+	for increment := 0; increment < IncrementalMaximumNumber && !found; increment++ {
+		for w := 0; w < walletCount && !found; w++ {
+			address_rate, err := b.Next(lbapi.DummyFactor)
+			if err != nil {
+				mylog.Logger.Error("获取钱包地址失败", zap.Any("err", err))
+				continue
+			}
 
-	for i := 0; i < IncrementalMaximumNumber && !found; i++ {
-		address_rate, err := b.Next(lbapi.DummyFactor)
-		if err != nil {
-			mylog.Logger.Error("获取钱包地址失败", zap.Any("err", err))
-			continue
+			s := strings.Split(address_rate.String(), ":")
+			if len(s) != 2 {
+				mylog.Logger.Error("钱包地址格式错误", zap.String("address_rate", address_rate.String()))
+				continue
+			}
+
+			Token = s[0]
+			rate, parseErr := strconv.ParseFloat(s[1], 64)
+			if parseErr != nil {
+				mylog.Logger.Error("汇率解析失败", zap.String("rate_str", s[1]), zap.Any("err", parseErr))
+				continue
+			}
+
+			mylog.Logger.Info("获取钱包地址成功", zap.Any("address", Token))
+			if rate <= 0 {
+				mylog.Logger.Info("CreateTransaction - 汇率检查失败", zap.Float64("rate", rate))
+				c.JSON(400, gin.H{"code": 1, "message": "钱包汇率配置错误,小于等于0"})
+				return
+			}
+
+			// 计算基础金额，加上当前递增偏移
+			baseAmount := math.Round((requestParams.Amount/rate)*100) / 100
+			ActualAmount = math.Round((baseAmount+float64(increment)*UsdtAmountPerIncrement)*100) / 100
+
+			// 检查换算后的金额是否符合最小支付金额
+			if ActualAmount < UsdtMinimumPaymentAmount {
+				c.JSON(400, gin.H{"code": 1, "message": "换算后的支付金额低于最小支付金额0.01"})
+				return
+			}
+
+			// Redis key 仅用金额，保证全局唯一
+			// 原子占用：用 SetNX 一步完成「检查+占用」，防止并发下单拿到相同金额
+			ActualAmount_Token := fmt.Sprintf("amount_%f", ActualAmount)
+			ok, setErr := rdb.RDB.SetNX(context.Background(), ActualAmount_Token, ActualAmount, sdb.GetSetting().ExpirationDate).Result()
+			if setErr != nil {
+				mylog.Logger.Error("占用 Redis 中金额时，操作过程发生错误", zap.Any("err", setErr))
+				continue
+			}
+			if ok {
+				// 抢占成功，该金额全局未被占用
+				found = true
+			}
+			// 抢占失败，继续尝试下一个钱包（同一金额）
 		}
-
-		s := strings.Split(address_rate.String(), ":")
-		if len(s) != 2 {
-			mylog.Logger.Error("钱包地址格式错误", zap.String("address_rate", address_rate.String()))
-			continue
-		}
-
-		Token = s[0]
-		rate, parseErr := strconv.ParseFloat(s[1], 64)
-		if parseErr != nil {
-			mylog.Logger.Error("汇率解析失败", zap.String("rate_str", s[1]), zap.Any("err", parseErr))
-			continue
-		}
-
-		mylog.Logger.Info("获取钱包地址成功", zap.Any("address", Token))
-		if rate <= 0 {
-			mylog.Logger.Info("CreateTransaction - 汇率检查失败", zap.Float64("rate", rate))
-			c.JSON(400, gin.H{"code": 1, "message": "钱包汇率配置错误,小于等于0"})
-			return
-		}
-
-		// 计算基础金额
-		baseAmount := math.Round((requestParams.Amount/rate)*100) / 100
-
-		// 全局递增：同一金额全局唯一，跨钱包不重复
-		ActualAmount = math.Round((baseAmount+float64(globalAttempts)*UsdtAmountPerIncrement)*100) / 100
-
-		// 检查换算后的金额是否符合最小支付金额
-		if ActualAmount < UsdtMinimumPaymentAmount {
-			c.JSON(400, gin.H{"code": 1, "message": "换算后的支付金额低于最小支付金额0.01"})
-			return
-		}
-
-		// Redis key 仅用金额，保证全局唯一（去掉钱包地址前缀）
-		// 原子占用：用 SetNX 一步完成「检查+占用」，防止并发下单拿到相同金额
-		ActualAmount_Token := fmt.Sprintf("amount_%f", ActualAmount)
-		ok, setErr := rdb.RDB.SetNX(context.Background(), ActualAmount_Token, ActualAmount, sdb.GetSetting().ExpirationDate).Result()
-		if setErr != nil {
-			mylog.Logger.Error("占用 Redis 中金额时，操作过程发生错误", zap.Any("err", setErr))
-			continue
-		}
-		if ok {
-			// 抢占成功，该金额全局未被占用
-			found = true
-			break
-		}
-		// 抢占失败，全局递增，下一轮换新金额（同时 RoundRobin 自动轮换钱包）
-		globalAttempts++
+		// 所有钱包该金额都被占用，递增金额再试
 	}
 
 	// 检查是否找到合适的配置
