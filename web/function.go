@@ -291,7 +291,7 @@ func CreateTransaction(c *gin.Context) {
 
 		sdb.DB.Save(&order1)
 
-		ActualAmount_Token := fmt.Sprintf("%s_%f", order1.Token, order1.ActualAmount)
+		ActualAmount_Token := fmt.Sprintf("amount_%f", order1.ActualAmount)
 
 		// 更新Redis中的钱包过期时间
 		err := rdb.RDB.Set(context.Background(), ActualAmount_Token, order1.ActualAmount, sdb.GetSetting().ExpirationDate).Err()
@@ -377,8 +377,8 @@ func CreateTransaction(c *gin.Context) {
 		b.Add(node)
 	}
 
-	// 记录每个钱包的尝试次数
-	walletAttempts := make(map[string]int)
+	// 全局递增次数（金额全局唯一，不按钱包分别计数）
+	globalAttempts := 0
 
 	for i := 0; i < IncrementalMaximumNumber && !found; i++ {
 		address_rate, err := b.Next(lbapi.DummyFactor)
@@ -410,9 +410,8 @@ func CreateTransaction(c *gin.Context) {
 		// 计算基础金额
 		baseAmount := math.Round((requestParams.Amount/rate)*100) / 100
 
-		// 根据当前钱包的尝试次数计算递增金额
-		attempts := walletAttempts[Token]
-		ActualAmount = math.Round((baseAmount+float64(attempts)*UsdtAmountPerIncrement)*100) / 100
+		// 全局递增：同一金额全局唯一，跨钱包不重复
+		ActualAmount = math.Round((baseAmount+float64(globalAttempts)*UsdtAmountPerIncrement)*100) / 100
 
 		// 检查换算后的金额是否符合最小支付金额
 		if ActualAmount < UsdtMinimumPaymentAmount {
@@ -420,23 +419,21 @@ func CreateTransaction(c *gin.Context) {
 			return
 		}
 
-		ActualAmount_Token := fmt.Sprintf("%s_%f", Token, ActualAmount)
-
-		// 原子占用「钱包地址+金额」：用 SetNX（SET if Not eXists）一步完成「检查+占用」。
-		// 不能拆成 EXISTS + SET 两步——两步非原子，并发下单算出相同尾数金额时会同时通过检查，
-		// 导致两个不同订单拥有相同的 Token+ActualAmount，一笔真实付款会被两个订单同时判为入账。
+		// Redis key 仅用金额，保证全局唯一（去掉钱包地址前缀）
+		// 原子占用：用 SetNX 一步完成「检查+占用」，防止并发下单拿到相同金额
+		ActualAmount_Token := fmt.Sprintf("amount_%f", ActualAmount)
 		ok, setErr := rdb.RDB.SetNX(context.Background(), ActualAmount_Token, ActualAmount, sdb.GetSetting().ExpirationDate).Result()
 		if setErr != nil {
 			mylog.Logger.Error("占用 Redis 中金额时，操作过程发生错误", zap.Any("err", setErr))
 			continue
 		}
 		if ok {
-			// 抢占成功，该金额此前未被占用
+			// 抢占成功，该金额全局未被占用
 			found = true
 			break
 		}
-		// 抢占失败，说明该金额已被占用，增加该钱包的尝试次数，换下一个递增金额
-		walletAttempts[Token]++
+		// 抢占失败，全局递增，下一轮换新金额（同时 RoundRobin 自动轮换钱包）
+		globalAttempts++
 	}
 
 	// 检查是否找到合适的配置

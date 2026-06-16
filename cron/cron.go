@@ -380,7 +380,7 @@ func generateSignature(data dto.PaymentNotification_request) string {
 // 解锁钱包地址和金额
 func unlockWalletAddressAndAmount(v sdb.Orders) {
 	// 解锁钱包地址和金额
-	address_amount := fmt.Sprintf("%s_%f", v.Token, v.ActualAmount)
+	address_amount := fmt.Sprintf("amount_%f", v.ActualAmount)
 	cx := context.Background()
 	err := rdb.RDB.Del(cx, address_amount).Err()
 	if err != nil {
