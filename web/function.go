@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +23,6 @@ import (
 	"github.com/gin-gonic/gin/binding"
 	"github.com/go-playground/validator/v10"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/hedzr/lb"
-	"github.com/hedzr/lb/lbapi"
 	"go.uber.org/zap"
 )
 
@@ -36,8 +33,9 @@ type MyClaims struct {
 }
 
 var (
-	secret  = sdb.GenerateSecretKey(256)
-	sync_mu sync.Mutex
+	secret        = sdb.GenerateSecretKey(256)
+	sync_mu       sync.Mutex
+	walletRRIndex int // 全局钱包轮询下标，跨请求保持状态实现真正的 RoundRobin
 )
 
 func GenerateToken() string {
@@ -369,37 +367,18 @@ func CreateTransaction(c *gin.Context) {
 	}
 	var Token string
 	var ActualAmount float64
-	// 默认值为false
 	var found = false
-	// 创建 RoundRobin 负载均衡器
-	b := lb.New(lb.RoundRobin)
-	for _, node := range walletAddrs {
-		b.Add(node)
-	}
 
 	// 外层按金额递增，内层遍历所有钱包尝试占用该金额
 	// 金额全局唯一：同一金额只能有一个订单，跨钱包不重复
+	// walletRRIndex 全局持久，保证跨请求真正交替分配钱包
 	walletCount := len(walletAddrs)
 	for increment := 0; increment < IncrementalMaximumNumber && !found; increment++ {
 		for w := 0; w < walletCount && !found; w++ {
-			address_rate, err := b.Next(lbapi.DummyFactor)
-			if err != nil {
-				mylog.Logger.Error("获取钱包地址失败", zap.Any("err", err))
-				continue
-			}
+			wallet := walletAddrs[(walletRRIndex+w)%walletCount]
 
-			s := strings.Split(address_rate.String(), ":")
-			if len(s) != 2 {
-				mylog.Logger.Error("钱包地址格式错误", zap.String("address_rate", address_rate.String()))
-				continue
-			}
-
-			Token = s[0]
-			rate, parseErr := strconv.ParseFloat(s[1], 64)
-			if parseErr != nil {
-				mylog.Logger.Error("汇率解析失败", zap.String("rate_str", s[1]), zap.Any("err", parseErr))
-				continue
-			}
+			Token = wallet.Token
+			rate := wallet.Rate
 
 			mylog.Logger.Info("获取钱包地址成功", zap.Any("address", Token))
 			if rate <= 0 {
@@ -427,7 +406,8 @@ func CreateTransaction(c *gin.Context) {
 				continue
 			}
 			if ok {
-				// 抢占成功，该金额全局未被占用
+				// 抢占成功，推进全局下标，下次从下一个钱包开始
+				walletRRIndex = (walletRRIndex + w + 1) % walletCount
 				found = true
 			}
 			// 抢占失败，继续尝试下一个钱包（同一金额）
