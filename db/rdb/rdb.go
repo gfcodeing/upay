@@ -3,6 +3,7 @@ package rdb
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 	"upay_pro/db/sdb"
 	"upay_pro/mylog"
@@ -14,12 +15,26 @@ import (
 var RDB *redis.Client
 
 func init() {
+	setting := sdb.GetSetting()
+
+	// Redis 地址：优先读环境变量 REDIS_HOST/REDIS_PORT，没有则读数据库配置
+	redisHost := setting.Redishost
+	if envHost := os.Getenv("REDIS_HOST"); envHost != "" {
+		redisHost = envHost
+	}
+	redisPort := setting.Redisport
+	redisPasswd := setting.Redispasswd
+	// Redis 密码：优先读环境变量 REDIS_PASS，没有则读数据库配置
+	if envPass := os.Getenv("REDIS_PASS"); envPass != "" {
+		redisPasswd = envPass
+	}
+
 	// 创建 Redis 客户端
 	rdb := redis.NewClient(&redis.Options{
 		// 基本连接配置
-		Addr:     fmt.Sprintf("%s:%d", sdb.GetSetting().Redishost, sdb.GetSetting().Redisport), // Redis 地址
-		Password: sdb.GetSetting().Redispasswd,                                                 // Redis 密码
-		DB:       sdb.GetSetting().Redisdb,                                                     // 数据库编号
+		Addr:     fmt.Sprintf("%s:%d", redisHost, redisPort), // Redis 地址
+		Password: redisPasswd,                                // Redis 密码
+		DB:       setting.Redisdb,                            // 数据库编号
 
 		// 连接超时设置
 		DialTimeout:  10 * time.Second, // 建立连接超时时间
