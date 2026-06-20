@@ -22,10 +22,11 @@ var (
 	// BSC RPC 节点列表（主用 + 备用）。callRPC 会按顺序逐个尝试，直到某个节点成功返回。
 	// 若全部失败则报错，避免单节点故障导致整体漏单。
 	bscRpcURLs = []string{
-		// 支持 eth_getLogs 的免费节点
+		// 支持 eth_getLogs 的免费节点（已验证 Docker 容器内可访问）
 		"https://bsc-rpc.publicnode.com",
 		"https://bsc.drpc.org",
-		"https://binance.llamarpc.com",
+		"https://rpc.ankr.com/bsc",
+		"https://bsc-dataseed1.defibit.io",
 	}
 )
 
