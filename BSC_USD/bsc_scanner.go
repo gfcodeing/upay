@@ -216,8 +216,8 @@ func scanAndMatch(order sdb.Orders) (txHash string, amount float64, timestampMs 
 			mylog.Logger.Warn("BSC-USDT 跳过一笔区块时间获取失败的日志", zap.String("txHash", l.TransactionHash), zap.Error(terr))
 			continue
 		}
-		// 时间窗口校验：必须落在订单开始与过期之间
-		if ts <= order.StartTime || ts >= order.ExpirationTime {
+		// 时间窗口校验：必须落在订单开始与过期之间（含边界）
+		if ts < order.StartTime || ts > order.ExpirationTime {
 			continue
 		}
 		return l.TransactionHash, amt, ts, true, nil

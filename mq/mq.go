@@ -3,6 +3,7 @@ package mq
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 	"upay_pro/db/sdb"
 	"upay_pro/mylog"
@@ -20,25 +21,35 @@ var Mux *asynq.ServeMux
 // 任务管理器
 var Inspector *asynq.Inspector
 
+// getMQRedisOpt 读取 Redis 连接配置，优先使用环境变量 REDIS_HOST / REDIS_PASS，
+// 没有时退回数据库配置，与 rdb.go 保持一致。
+func getMQRedisOpt() asynq.RedisClientOpt {
+	setting := sdb.GetSetting()
+
+	redisHost := setting.Redishost
+	if envHost := os.Getenv("REDIS_HOST"); envHost != "" {
+		redisHost = envHost
+	}
+	redisPasswd := setting.Redispasswd
+	if envPass := os.Getenv("REDIS_PASS"); envPass != "" {
+		redisPasswd = envPass
+	}
+
+	return asynq.RedisClientOpt{
+		Addr:     fmt.Sprintf("%s:%d", redisHost, setting.Redisport),
+		Password: redisPasswd,
+		DB:       setting.Redisdb,
+	}
+}
+
 func init() {
-	// 获取redis地址
-	addr := fmt.Sprintf("%s:%d", sdb.GetSetting().Redishost, sdb.GetSetting().Redisport)
+	opt := getMQRedisOpt()
 	// 初始客户端
-	client := asynq.NewClient(asynq.RedisClientOpt{
-		Addr:     addr,
-		Password: sdb.GetSetting().Redispasswd,
-		DB:       sdb.GetSetting().Redisdb,
-	})
-	Client = client
+	Client = asynq.NewClient(opt)
 	// 初始化任务管理器
-	Inspector = asynq.NewInspector(asynq.RedisClientOpt{
-		Addr:     addr,
-		Password: sdb.GetSetting().Redispasswd,
-		DB:       sdb.GetSetting().Redisdb,
-	})
+	Inspector = asynq.NewInspector(opt)
 	// 启动异步任务服务器
 	go async_server_run()
-
 }
 
 // QueueOrderExpiration 订单过期任务的队列名称
@@ -68,13 +79,7 @@ func async_server_run() {
 	Mux = asynq.NewServeMux()
 	// 注册处理函数，根据任务名称，调用不同的处理函数
 	Mux.HandleFunc(QueueOrderExpiration, handleCheckStatusCodeTask)
-	// 获取redis地址
-	addr := fmt.Sprintf("%s:%d", sdb.GetSetting().Redishost, sdb.GetSetting().Redisport)
-	server := asynq.NewServer(asynq.RedisClientOpt{
-		Addr:     addr,
-		Password: sdb.GetSetting().Redispasswd,
-		DB:       sdb.GetSetting().Redisdb,
-	}, asynq.Config{Concurrency: 10})
+	server := asynq.NewServer(getMQRedisOpt(), asynq.Config{Concurrency: 10})
 	if err := server.Run(Mux); err != nil {
 		mylog.Logger.Info("Error starting server:", zap.Any("err", err))
 	}

@@ -35,15 +35,19 @@ mkdir -p "$DATA_DIR" "$LOG_DIR"
 docker network create upay_net 2>/dev/null || true
 
 # 确保 Redis 容器在运行
-if ! docker ps | grep -q upay_redis; then
+# 用 docker ps -a 检测所有状态（含已退出），避免容器存在但已停止时再次 docker run 报名称冲突
+if docker ps -a --format '{{.Names}}' | grep -q "^upay_redis$"; then
+  # 容器已存在：若没在运行则先启动，再接入网络
+  docker start upay_redis 2>/dev/null || true
+  docker network connect upay_net upay_redis 2>/dev/null || true
+else
+  # 容器不存在：新建
   docker run -d \
     --name upay_redis \
     --restart always \
     --network upay_net \
     redis:7-alpine \
     redis-server --requirepass "$REDIS_PASS"
-else
-  docker network connect upay_net upay_redis 2>/dev/null || true
 fi
 
 docker run -d \

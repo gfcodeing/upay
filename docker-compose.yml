@@ -14,6 +14,7 @@ services:
     command: redis-server --requirepass 285a25a719788693
 
   upay_pro:
+    build: .          # 构建本地 Dockerfile
     image: upay_pro:latest
     container_name: upay_pro
     restart: always
