@@ -13,6 +13,7 @@ CONTAINER_NAME="upay_pro"     # 容器名
 PORT_CHECK="8090"             # 程序监听端口（用于健康检查）
 DATA_DIR="$DEPLOY_DIR/data"   # 数据库持久化目录（挂载到容器 /app/DBS）
 LOG_DIR="$DEPLOY_DIR/log"     # 日志持久化目录（挂载到容器 /app/log）
+REDIS_PASS="285a25a719788693" # Redis 密码
 # ========================================================
 
 cd "$DEPLOY_DIR"
@@ -36,6 +37,8 @@ docker run -d \
   --network host \
   -v "$DATA_DIR:/app/DBS" \
   -v "$LOG_DIR:/app/log" \
+  -e TZ=Asia/Shanghai \
+  -e REDIS_PASS="$REDIS_PASS" \
   "${IMAGE_NAME}:latest"
 
 echo ">>> [5/5] 部署完成，等待启动..."
