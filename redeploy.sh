@@ -14,6 +14,7 @@ PORT_CHECK="8090"             # 程序监听端口（用于健康检查）
 DATA_DIR="$DEPLOY_DIR/data"   # 数据库持久化目录（挂载到容器 /app/DBS）
 LOG_DIR="$DEPLOY_DIR/log"     # 日志持久化目录（挂载到容器 /app/log）
 REDIS_PASS="285a25a719788693" # Redis 密码
+REDIS_HOST="upay_redis"       # Redis 容器名（通过 Docker 网络访问）
 # ========================================================
 
 cd "$DEPLOY_DIR"
@@ -27,17 +28,33 @@ docker build -t "${IMAGE_NAME}:latest" .
 echo ">>> [3/5] 停止并删除旧容器..."
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-echo ">>> [4/5] 启动新容器（host 网络，连宿主机 Redis）..."
+echo ">>> [4/5] 启动新容器..."
 mkdir -p "$DATA_DIR" "$LOG_DIR"
-# 用 --network host 让容器能访问宿主机 Redis(127.0.0.1:6379)，因此不需要 -p 端口映射；
-# 程序直接监听宿主机的 8090。
+
+# 确保 upay 专用网络存在
+docker network create upay_net 2>/dev/null || true
+
+# 确保 Redis 容器在运行
+if ! docker ps | grep -q upay_redis; then
+  docker run -d \
+    --name upay_redis \
+    --restart always \
+    --network upay_net \
+    redis:7-alpine \
+    redis-server --requirepass "$REDIS_PASS"
+else
+  docker network connect upay_net upay_redis 2>/dev/null || true
+fi
+
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart always \
-  --network host \
+  --network upay_net \
+  -p 127.0.0.1:8090:8090 \
   -v "$DATA_DIR:/app/DBS" \
   -v "$LOG_DIR:/app/log" \
   -e TZ=Asia/Shanghai \
+  -e REDIS_HOST="$REDIS_HOST" \
   -e REDIS_PASS="$REDIS_PASS" \
   "${IMAGE_NAME}:latest"
 

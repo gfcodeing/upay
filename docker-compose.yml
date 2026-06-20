@@ -1,10 +1,26 @@
 version: "3.8"
 
+networks:
+  upay_net:
+    driver: bridge
+
 services:
+  upay_redis:
+    image: redis:7-alpine
+    container_name: upay_redis
+    restart: always
+    networks:
+      - upay_net
+    command: redis-server --requirepass 285a25a719788693
+
   upay_pro:
     image: upay_pro:latest
     container_name: upay_pro
     restart: always
+    depends_on:
+      - upay_redis
+    networks:
+      - upay_net
     ports:
       - "127.0.0.1:8090:8090"
     volumes:
@@ -14,3 +30,5 @@ services:
       - /www/upay/log:/app/log
     environment:
       - TZ=Asia/Shanghai
+      - REDIS_HOST=upay_redis
+      - REDIS_PASS=285a25a719788693
